@@ -85,220 +85,48 @@ INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (3, 
 
 COMMIT;
 ```
-
-</details>
-
-<details>
-<summary><strong>plsql/pkg_orders.pks</strong></summary>
-
 ```sql
--- pkg_orders.pks
-CREATE OR REPLACE PACKAGE pkg_orders IS
-  -- record type for a single order item
-  TYPE t_item_rec IS RECORD (
-    product_id NUMBER,
-    quantity   NUMBER,
-    unit_price NUMBER
+SET SERVEROUTPUT ON;
+
+DECLARE
+  TYPE customer_rec IS RECORD (
+    name customers.name%TYPE,
+    email customers.email%TYPE
   );
 
-  -- nested table type of item records
-  TYPE t_item_table IS TABLE OF t_item_rec;
+  TYPE customer_tab IS TABLE OF customer_rec;
+  customers_list customer_tab := customer_tab();
 
-  -- associative arrays (index by product_id) for price and stock caching
-  TYPE t_price_map IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
-  TYPE t_stock_map IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
-
-  PROCEDURE process_pending_orders(p_max_orders IN PLS_INTEGER DEFAULT 100);
-END pkg_orders;
-/
-```
-
-</details>
-
-<details>
-<summary><strong>plsql/pkg_orders.pkb</strong></summary>
-
-```sql
--- pkg_orders.pkb
-CREATE OR REPLACE PACKAGE BODY pkg_orders IS
-  PROCEDURE process_pending_orders(p_max_orders IN PLS_INTEGER DEFAULT 100) IS
-    -- local variables
-    CURSOR c_orders IS
-      SELECT order_id, customer_id FROM orders WHERE status = 'PENDING' ORDER BY order_date FOR UPDATE;
-
-    v_order_id   orders.order_id%TYPE;
-    v_customer   orders.customer_id%TYPE;
-
-    -- collections
-    v_prices     t_price_map;
-    v_stock      t_stock_map;
-
-    v_items      t_item_table; -- nested table of item records
-
-    -- counters
-    v_processed  INTEGER := 0;
-    v_committed  INTEGER := 0;
-    v_skipped    INTEGER := 0;
-
-    -- an execution log (in-memory)
-    TYPE t_log_tab IS TABLE OF VARCHAR2(4000) INDEX BY PLS_INTEGER;
-    v_log t_log_tab;
-    v_log_idx INTEGER := 0;
-
-    -- control flags
-    v_abort BOOLEAN := FALSE;
-
-    -- exceptions
-    ex_insufficient_stock EXCEPTION;
-
-  BEGIN
-    -- load caches (prices and stock) into associative arrays
-    FOR r IN (SELECT product_id, price, stock FROM products) LOOP
-      v_prices(r.product_id) := r.price;
-      v_stock(r.product_id) := r.stock;
-    END LOOP;
-
-    OPEN c_orders;
-    LOOP
-      FETCH c_orders INTO v_order_id, v_customer;
-      EXIT WHEN c_orders%NOTFOUND OR v_processed >= p_max_orders;
-      v_processed := v_processed + 1;
-
-      -- load order items into the nested table
-      v_items := t_item_table(); -- initialize
-      FOR r_it IN (SELECT product_id, quantity, unit_price FROM order_items WHERE order_id = v_order_id) LOOP
-        v_items.EXTEND;
-        v_items(v_items.LAST).product_id := r_it.product_id;
-        v_items(v_items.LAST).quantity   := r_it.quantity;
-        v_items(v_items.LAST).unit_price := r_it.unit_price;
-      END LOOP;
-
-      -- compute total and attempt to deduct stock in-memory
-      DECLARE
-        v_total NUMBER := 0;
-      BEGIN
-        FOR i IN 1 .. v_items.COUNT LOOP
-          IF NOT v_prices.EXISTS(v_items(i).product_id) THEN
-            v_log_idx := v_log_idx + 1;
-            v_log(v_log_idx) := 'Order '||v_order_id||': product '||v_items(i).product_id||' missing in catalog; skipping';
-            v_skipped := v_skipped + 1;
-            GOTO skip_to_next_order; -- show GOTO usage: skip to label
-          END IF;
-
-          v_total := v_total + v_items(i).quantity * v_prices(v_items(i).product_id);
-
-          -- check stock
-          IF v_stock(v_items(i).product_id) - v_items(i).quantity < 0 THEN
-            -- insufficient stock — simulate critical error path
-            v_log_idx := v_log_idx + 1;
-            v_log(v_log_idx) := 'Order '||v_order_id||': insufficient stock for product '||v_items(i).product_id;
-            -- set flag to indicate we should skip/rollback this order
-            RAISE ex_insufficient_stock;
-          ELSE
-            -- deduct from in-memory stock
-            v_stock(v_items(i).product_id) := v_stock(v_items(i).product_id) - v_items(i).quantity;
-          END IF;
-        END LOOP; -- items
-
-        -- If we reach here, apply updates to DB
-        SAVEPOINT sp_before_order__||v_order_id;
-        BEGIN
-          -- update products table stock
-          FOR i IN 1 .. v_items.COUNT LOOP
-            UPDATE products
-            SET stock = stock - v_items(i).quantity
-            WHERE product_id = v_items(i).product_id;
-          END LOOP;
-
-          -- update the order total and mark completed
-          UPDATE orders SET total_amount = v_total, status = 'COMPLETED' WHERE order_id = v_order_id;
-          v_committed := v_committed + 1;
-          v_log_idx := v_log_idx + 1;
-          v_log(v_log_idx) := 'Order '||v_order_id||' processed OK. Total='||TO_CHAR(v_total);
-        EXCEPTION
-          WHEN OTHERS THEN
-            -- On unexpected DB error, rollback to savepoint and mark skipped
-            ROLLBACK TO SAVEPOINT sp_before_order__||v_order_id;
-            v_skipped := v_skipped + 1;
-            v_log_idx := v_log_idx + 1;
-            v_log(v_log_idx) := 'Order '||v_order_id||' failed during DB update: '||SQLERRM;
-        END;
-
-      EXCEPTION
-        WHEN ex_insufficient_stock THEN
-          -- demonstrate GOTO to shared error handler
-          GOTO handle_order_error;
-        WHEN OTHERS THEN
-          v_log_idx := v_log_idx + 1;
-          v_log(v_log_idx) := 'Order '||v_order_id||' unexpected error: '||SQLERRM;
-          v_skipped := v_skipped + 1;
-      END; -- inner block
-
-      <<skip_to_next_order>>
-      NULL; -- label target for normal skips
-      CONTINUE;
-
-      <<handle_order_error>>
-      -- error handling block reached via RAISE then GOTO
-      v_log_idx := v_log_idx + 1;
-      v_log(v_log_idx) := 'Order '||v_order_id||': handled by GOTO error path and skipped';
-      v_skipped := v_skipped + 1;
-      -- optionally perform cleanup per-order here (no DB changes applied)
-
-    END LOOP;
-    CLOSE c_orders;
-
-    -- final report
-    v_log_idx := v_log_idx + 1;
-    v_log(v_log_idx) := 'Processed='||v_processed||', Committed='||v_committed||', Skipped='||v_skipped;
-
-    -- print the log
-    FOR i IN 1 .. v_log.COUNT LOOP
-      DBMS_OUTPUT.PUT_LINE(v_log(i));
-    END LOOP;
-
-  EXCEPTION
-    WHEN OTHERS THEN
-      DBMS_OUTPUT.PUT_LINE('Fatal error in process_pending_orders: '||SQLERRM);
-      RAISE;
-  END process_pending_orders;
-END pkg_orders;
-/
-```
-
-</details>
-
-<details>
-<summary><strong>plsql/process_orders.sql</strong></summary>
-
-```sql
--- process_orders.sql
-SET SERVEROUTPUT ON SIZE 1000000;
+  i NUMBER := 1;
 BEGIN
-  -- process up to 100 orders
-  pkg_orders.process_pending_orders(100);
+  -- Load customers into collection
+  FOR rec IN (SELECT name, email FROM customers) LOOP
+    customers_list.EXTEND;
+    customers_list(customers_list.LAST).name := rec.name;
+    customers_list(customers_list.LAST).email := rec.email;
+  END LOOP;
+
+  <<display_loop>>
+  IF i > customers_list.COUNT THEN
+    GOTO finish;
+  END IF;
+
+  DBMS_OUTPUT.PUT_LINE('Customer ' || i || ': ' || customers_list(i).name || ' - ' || customers_list(i).email);
+  i := i + 1;
+  GOTO display_loop;
+
+  <<finish>>
+  DBMS_OUTPUT.PUT_LINE('--- Done displaying customers ---');
 END;
 /
 ```
 
-</details>
-
-<details>
-<summary><strong>tests/run_tests.sql</strong></summary>
-
-```sql
--- run_tests.sql
--- 1) Show initial product stocks
-SELECT product_id, name, stock FROM products;
-
--- 2) Run the processing script
-@plsql/process_orders.sql
-
--- 3) Check results
-SELECT order_id, status, total_amount FROM orders ORDER BY order_id;
-SELECT product_id, name, stock FROM products ORDER BY product_id;
-```
-
+</details>        
 </details>
 
 ---
+**OUTPUT**
+<img width="1366" height="718" alt="Screenshot 2025-11-11 184411" src="https://github.com/user-attachments/assets/601bf013-5648-4838-ad59-fe35b942c500" />
+
+
+
